@@ -1,0 +1,269 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import numpy as np
+from torch.autograd import grad
+import matplotlib.pyplot as plt
+import os
+import pandas as pd
+torch.manual_seed(42)
+np.random.seed(42)
+
+Re = 1
+nu = 1.0 / Re
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+pi = torch.tensor(1, device=device, dtype=torch.float32)
+
+x_range = (0, pi)
+y_range = (0, pi)
+
+N_e = 4096
+N_b = 800
+num_iterations = 17001
+lr = 0.001
+beta = 0.5
+hidden_layers = 6
+hidden_dim = 128
+
+class PINN(nn.Module):
+    def __init__(self):
+        super(PINN, self).__init__()
+        self.input_layer = nn.Linear(2, hidden_dim)
+        self.hidden = nn.Sequential(
+            *[nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.SiLU())
+              for _ in range(hidden_layers)]
+        )
+        self.output_layer = nn.Linear(hidden_dim, 3)
+
+    def forward(self, x, y):
+        inputs = torch.cat([x, y], dim=1)
+        x = self.input_layer(inputs)
+        x = self.hidden(x)
+        u1, u2, P = self.output_layer(x).chunk(3, dim=1)
+        return u1, u2, P
+
+def sample_interior_points():
+    x = torch.rand(N_e, 1, device=device) * (x_range[1] - x_range[0]) + x_range[0]
+    y = torch.rand(N_e, 1, device=device) * (y_range[1] - y_range[0]) + y_range[0]
+    return x.requires_grad_(True), y.requires_grad_(True)
+
+def sample_boundary_points():
+    n_per_side = N_b // 4
+    dtype = torch.float32
+
+    x1 = torch.full((n_per_side, 1), x_range[0], device=device, dtype=dtype)
+    y1 = torch.linspace(y_range[0], y_range[1], n_per_side, device=device, dtype=dtype).reshape(-1,1)
+
+    x2 = torch.full((n_per_side, 1), x_range[1], device=device, dtype=dtype)
+    y2 = torch.linspace(y_range[0], y_range[1], n_per_side, device=device, dtype=dtype).reshape(-1,1)
+
+    x3 = torch.linspace(x_range[0], x_range[1], n_per_side, device=device, dtype=dtype).reshape(-1,1)
+    y3 = torch.full((n_per_side, 1), y_range[0], device=device, dtype=dtype)
+
+    x4 = torch.linspace(x_range[0], x_range[1], n_per_side, device=device, dtype=dtype).reshape(-1,1)
+    y4 = torch.full((n_per_side, 1), y_range[1], device=device, dtype=dtype)
+
+    edge1 = (x1.requires_grad_(True), y1.requires_grad_(True))
+    edge2 = (x2.requires_grad_(True), y2.requires_grad_(True))
+    edge3 = (x3.requires_grad_(True), y3.requires_grad_(True))
+    edge4 = (x4.requires_grad_(True), y4.requires_grad_(True))
+
+    return [edge1, edge2, edge3, edge4]
+
+def get_analytical_solution(x, y):
+    u1_star = x**2 - y**2
+    u2_star = -2 * x * y
+    P_star = -0.5 * (x**2 + y**2)**2
+    return u1_star, u2_star, P_star
+
+def compute_ns_residuals(u1, u2, P, x, y):
+    u1_x = grad(u1.sum(), x, create_graph=True)[0]
+    u1_y = grad(u1.sum(), y, create_graph=True)[0]
+    u2_x = grad(u2.sum(), x, create_graph=True)[0]
+    u2_y = grad(u2.sum(), y, create_graph=True)[0]
+    P_x = grad(P.sum(), x, create_graph=True)[0]
+    P_y = grad(P.sum(), y, create_graph=True)[0]
+
+    u1_xx = grad(u1_x.sum(), x, create_graph=True)[0]
+    u1_yy = grad(u1_y.sum(), y, create_graph=True)[0]
+    u2_xx = grad(u2_x.sum(), x, create_graph=True)[0]
+    u2_yy = grad(u2_y.sum(), y, create_graph=True)[0]
+
+    res_x = u1*u1_x + u2*u1_y + P_x - nu*(u1_xx + u1_yy)
+    res_y = u1*u2_x + u2*u2_y + P_y - nu*(u2_xx + u2_yy)
+    res_div = u1_x + u2_y
+    return res_x, res_y, res_div
+
+def compute_total_loss(model):
+    x_e, y_e = sample_interior_points()
+    u1_e, u2_e, P_e = model(x_e, y_e)
+    res_x, res_y, res_div = compute_ns_residuals(u1_e, u2_e, P_e, x_e, y_e)
+    loss_eq = (res_x**2).mean() + (res_y**2).mean() + (res_div**2).mean()
+
+    edges = sample_boundary_points()
+    loss_bnd = 0.0
+    for edge in edges:
+        x_b, y_b = edge
+        u1_pred, u2_pred, _ = model(x_b, y_b)
+        u1_star, u2_star, _ = get_analytical_solution(x_b, y_b)
+        loss_u1 = ((u1_pred - u1_star)**2).mean()
+        loss_u2 = ((u2_pred - u2_star)**2).mean()
+        loss_bnd += loss_u1 + loss_u2
+    loss_bnd /= len(edges)
+
+    total_loss = loss_eq + beta * loss_bnd
+    return total_loss, loss_eq, loss_bnd
+
+def calculate_errors(model):
+    model.eval()
+    with torch.no_grad():
+        x_val = torch.linspace(x_range[0], x_range[1],100,device=device).unsqueeze(1)
+        y_val = torch.linspace(x_range[0], x_range[1],100,device=device).unsqueeze(1)
+        x_flat, y_flat = torch.meshgrid(x_val.squeeze(), y_val.squeeze(), indexing="ij")
+        x_flat = x_flat.reshape(-1,1)
+        y_flat = y_flat.reshape(-1,1)
+        
+        u1_pred, u2_pred, _ = model(x_flat, y_flat)
+        u1_star, u2_star, _ = get_analytical_solution(x_flat, y_flat)
+        
+        l2_u1 = torch.sqrt(((u1_pred-u1_star)**2).mean()).item()
+        l2_u2 = torch.sqrt(((u2_pred-u2_star)**2).mean()).item()
+
+        norm_u1 = torch.norm(u1_star).item()
+        norm_u2 = torch.norm(u2_star).item()
+        eps = 1e-8
+        rel_u1 = l2_u1 / (norm_u1 + eps) *100
+        rel_u2 = l2_u2 / (norm_u2 + eps) *100
+        
+    return l2_u1, l2_u2, rel_u1, rel_u2
+
+def visualize_results(model, loss_history=None, save_path=None, show_plot=False):
+    model.eval()
+    with torch.no_grad():
+        n_grid = 100
+        x_val = torch.linspace(x_range[0], x_range[1], n_grid, device=device).unsqueeze(1)
+        y_val = torch.linspace(y_range[0], y_range[1], n_grid, device=device).unsqueeze(1)
+        x_grid, y_grid = torch.meshgrid(x_val.squeeze(), y_val.squeeze(), indexing="ij")
+        x_flat = x_grid.reshape(-1, 1)
+        y_flat = y_grid.reshape(-1, 1)
+
+        u1_pred, u2_pred, _ = model(x_flat, y_flat)
+        u1_star, u2_star, _ = get_analytical_solution(x_flat, y_flat)
+
+        u1_pred_grid = u1_pred.reshape(n_grid, n_grid).cpu().numpy()
+        u1_star_grid = u1_star.reshape(n_grid, n_grid).cpu().numpy()
+        u1_err_grid = np.abs(u1_pred_grid - u1_star_grid)
+
+        u2_pred_grid = u2_pred.reshape(n_grid, n_grid).cpu().numpy()
+        u2_star_grid = u2_star.reshape(n_grid, n_grid).cpu().numpy()
+        u2_err_grid = np.abs(u2_pred_grid - u2_star_grid)
+
+        x_plot = x_grid.cpu().numpy()
+        y_plot = y_grid.cpu().numpy()
+
+        fig, axes = plt.subplots(2, 3, figsize=(16,8))
+        fig.suptitle(f'Tr-PINNs Results (Re={Re}) ', fontsize=16)
+
+        axes[0,0].contourf(x_plot, y_plot, u1_pred_grid, cmap='viridis', levels=50)
+        axes[0,0].set_title('u₁ Prediction')
+        axes[0,1].contourf(x_plot, y_plot, u1_star_grid, cmap='viridis', levels=50)
+        axes[0,1].set_title('u₁ Analytical')
+        im3 = axes[0,2].contourf(x_plot, y_plot, u1_err_grid, cmap='viridis', levels=50)
+        axes[0,2].set_title(f'u₁ Error max={u1_err_grid.max():.4f}')
+        plt.colorbar(im3, ax=axes[0,2])
+
+        axes[1,0].contourf(x_plot, y_plot, u2_pred_grid, cmap='viridis', levels=50)
+        axes[1,0].set_title('u₂ Prediction')
+        axes[1,1].contourf(x_plot, y_plot, u2_star_grid, cmap='viridis', levels=50)
+        axes[1,1].set_title('u₂ Analytical')
+        im6 = axes[1,2].contourf(x_plot, y_plot, u2_err_grid, cmap='viridis', levels=50)
+        axes[1,2].set_title(f'u₂ Error max={u2_err_grid.max():.4f}')
+        plt.colorbar(im6, ax=axes[1,2])
+       
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        if show_plot:
+            plt.show()
+        else:
+            plt.close(fig)
+
+def train_pinn():
+    os.makedirs("pinn_results", exist_ok=True)
+    model = PINN().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_iterations, eta_min=1e-7)
+    loss_history = []
+
+    for iter in range(num_iterations + 1):
+        if iter == 15001 and not isinstance(optimizer, optim.LBFGS):
+            print("Switching to LBFGS optimizer...")
+            optimizer = optim.LBFGS(model.parameters(), lr=0.1, max_iter=50)
+        
+        def closure():
+            optimizer.zero_grad()
+            total_loss, loss_eq, loss_bnd = compute_total_loss(model)
+            total_loss.backward()
+            return total_loss
+        
+        optimizer.step(closure)
+        total_loss, loss_eq, loss_bnd = compute_total_loss(model)
+        scheduler.step()
+
+        if iter % 1000 == 0:
+            loss_history.append({"iter": iter, "total_loss": total_loss.item()})
+            l2_u1, l2_u2, rel_u1, rel_u2 = calculate_errors(model)
+            print(f"\n==================== Iteration {iter:5d} ====================")
+            print(f"Total Loss: {total_loss.item():.6f} | Equation Residual: {loss_eq.item():.6f} | Boundary Loss: {loss_bnd.item():.6f}")
+            print(f"L2 RMSE: u1={l2_u1:.6f}, u2={l2_u2:.6f}")
+            print(f"L2 Relative Error: u1={rel_u1:.6%}, u2={rel_u2:.6%}")
+            visualize_results(model, save_path=f"pinn_results/iter_{iter}.png", show_plot=False)
+
+    print("\n==================== Training Complete! Final Errors ====================")
+    l2_u1, l2_u2, rel_u1, rel_u2 = calculate_errors(model)
+    print(f"L2 RMSE: u1={l2_u1:.6f}, u2={l2_u2:.6f}")
+    print(f"L2 Relative Error: u1={rel_u1:.6%}, u2={rel_u2:.6%}")
+    
+    model.eval()
+    with torch.no_grad():
+        n_grid = 100
+        x_val = torch.linspace(x_range[0], x_range[1], n_grid, device=device)
+        y_val = torch.linspace(y_range[0], y_range[1], n_grid, device=device)
+        X, Y = torch.meshgrid(x_val, y_val, indexing="ij")
+        x_flat = X.reshape(-1, 1)
+        y_flat = Y.reshape(-1, 1)
+
+        u1_pred, u2_pred, _ = model(x_flat, y_flat)
+        u1_true, u2_true, _ = get_analytical_solution(x_flat, y_flat)
+
+        x_np = x_flat.cpu().numpy().squeeze()
+        y_np = y_flat.cpu().numpy().squeeze()
+        u1_pred_np = u1_pred.cpu().numpy().squeeze()
+        u2_pred_np = u2_pred.cpu().numpy().squeeze()
+        u1_true_np = u1_true.cpu().numpy().squeeze()
+        u2_true_np = u2_true.cpu().numpy().squeeze()
+
+    df = pd.DataFrame({
+        "x": x_np,
+        "y": y_np,
+        "u1_pred": u1_pred_np,
+        "u2_pred": u2_pred_np,
+        "u1_true": u1_true_np,
+        "u2_true": u2_true_np,
+    })
+    df.to_csv("pinn_results/final_predictions.csv", index=False, encoding="utf-8-sig")
+    print("\nAll grid point predictions saved to: pinn_results/final_predictions-L.csv")
+
+    visualize_results(model, show_plot=True)
+    return model, loss_history
+
+if __name__ == "__main__":
+    trained_model, loss_history = train_pinn()
+    plt.figure(figsize=(10,6))
+    plt.semilogy([h["iter"] for h in loss_history], [h["total_loss"] for h in loss_history])
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss (Log Scale)")
+    plt.title("Training Loss | Unsupervised + Random Interior Points")
+    plt.grid()
+    plt.show()
