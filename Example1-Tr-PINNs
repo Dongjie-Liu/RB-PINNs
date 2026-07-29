@@ -7,15 +7,16 @@ from torch.autograd import grad
 import matplotlib.pyplot as plt
 import os
 import pandas as pd
+
 torch.manual_seed(42)
 np.random.seed(42)
 
 Re = 40
 nu = 1.0 / Re
-xi = 1/(2*nu) - np.sqrt(1/(4*nu**2) + 4*np.pi**2)
+xi = 1 / (2 * nu) - np.sqrt(1 / (4 * nu**2) + 4 * np.pi**2)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 xi = torch.tensor(xi, dtype=torch.float32, device=device)
-pi = torch.tensor(np.pi, device=device, dtype=torch.float32)
+pi = torch.tensor(np.pi, dtype=torch.float32, device=device)
 
 x_range = (-0.5, 1.5)
 y_range = (-0.5, 1.5)
@@ -25,8 +26,17 @@ N_b = 800
 num_iterations = 17001
 lr = 0.001
 beta = 0.5
+alpha = 0.1
 hidden_layers = 6
 hidden_dim = 128
+
+def compute_C(xi):
+    F = lambda x: x - (1 / (2 * xi)) * torch.exp(2 * xi * x)
+    integral = F(torch.tensor(1.5, device=device)) - F(torch.tensor(-0.5, device=device))
+    return -integral / 4.0
+
+C = compute_C(xi)
+print(f"C: {C.item():.6f}")
 
 class PINN(nn.Module):
     def __init__(self):
@@ -54,15 +64,15 @@ def sample_boundary_points():
     n_per_side = N_b // 4
 
     x1 = torch.full((n_per_side, 1), x_range[0], device=device)
-    y1 = torch.linspace(y_range[0], y_range[1], n_per_side, device=device).reshape(-1,1)
+    y1 = torch.linspace(y_range[0], y_range[1], n_per_side, device=device).reshape(-1, 1)
 
     x2 = torch.full((n_per_side, 1), x_range[1], device=device)
-    y2 = torch.linspace(y_range[0], y_range[1], n_per_side, device=device).reshape(-1,1)
+    y2 = torch.linspace(y_range[0], y_range[1], n_per_side, device=device).reshape(-1, 1)
 
-    x3 = torch.linspace(x_range[0], x_range[1], n_per_side, device=device).reshape(-1,1)
+    x3 = torch.linspace(x_range[0], x_range[1], n_per_side, device=device).reshape(-1, 1)
     y3 = torch.full((n_per_side, 1), y_range[0], device=device)
 
-    x4 = torch.linspace(x_range[0], x_range[1], n_per_side, device=device).reshape(-1,1)
+    x4 = torch.linspace(x_range[0], x_range[1], n_per_side, device=device).reshape(-1, 1)
     y4 = torch.full((n_per_side, 1), y_range[1], device=device)
 
     edge1 = (x1.requires_grad_(True), y1.requires_grad_(True))
@@ -76,7 +86,8 @@ def get_analytical_solution(x, y):
     u1_star = 1 - torch.exp(xi * x) * torch.cos(2 * pi * y)
     u2_star = (xi / (2 * pi)) * torch.exp(xi * x) * torch.sin(2 * pi * y)
     P_star = 0.5 * (1 - torch.exp(2 * xi * x))
-    return u1_star, u2_star, P_star
+    P_normalized = P_star + C
+    return u1_star, u2_star, P_normalized
 
 def compute_ns_residuals(u1, u2, P, x, y):
     u1_x = grad(u1.sum(), x, create_graph=True)[0]
@@ -91,14 +102,14 @@ def compute_ns_residuals(u1, u2, P, x, y):
     u2_xx = grad(u2_x.sum(), x, create_graph=True)[0]
     u2_yy = grad(u2_y.sum(), y, create_graph=True)[0]
 
-    res_x = u1*u1_x + u2*u1_y + P_x - nu*(u1_xx + u1_yy)
-    res_y = u1*u2_x + u2*u2_y + P_y - nu*(u2_xx + u2_yy)
+    res_x = u1 * u1_x + u2 * u1_y + P_x - nu * (u1_xx + u1_yy)
+    res_y = u1 * u2_x + u2 * u2_y + P_y - nu * (u2_xx + u2_yy)
     res_div = u1_x + u2_y
     return res_x, res_y, res_div
 
 def compute_h1_2_squared(v_pred, v_star, edge):
     e = v_pred - v_star
-    x, y= edge
+    x, y = edge
     n = e.shape[0]
 
     if n < 2:
@@ -154,37 +165,42 @@ def compute_total_loss(model):
         loss_u1_l2 = ((u1_b_l2 - u1_b_star_l2)**2).mean()
         loss_u2_l2 = ((u2_b_l2 - u2_b_star_l2)**2).mean()
 
-        loss_bnd += semi_weight * (loss_u1_semi + loss_u2_semi) +  l2_weight * (loss_u1_l2 + loss_u2_l2 )
+        loss_bnd += semi_weight * (loss_u1_semi + loss_u2_semi) + l2_weight * (loss_u1_l2 + loss_u2_l2)
 
     loss_bnd /= len(edges)
 
-    total_loss = loss_eq + beta * loss_bnd
-    return total_loss, loss_eq, loss_bnd
+    loss_p_mean = (P_e.mean()) ** 2
+
+    total_loss = loss_eq + beta * loss_bnd + alpha * loss_p_mean
+    return total_loss, loss_eq, loss_bnd, loss_p_mean
 
 def calculate_errors(model):
     model.eval()
     with torch.no_grad():
-        x_val = torch.linspace(x_range[0], x_range[1],100,device=device).unsqueeze(1)
-        y_val = torch.linspace(x_range[0], x_range[1],100,device=device).unsqueeze(1)
+        x_val = torch.linspace(x_range[0], x_range[1], 100, device=device).unsqueeze(1)
+        y_val = torch.linspace(y_range[0], y_range[1], 100, device=device).unsqueeze(1)
         x_flat, y_flat = torch.meshgrid(x_val.squeeze(), y_val.squeeze(), indexing="ij")
-        x_flat = x_flat.reshape(-1,1)
-        y_flat = y_flat.reshape(-1,1)
+        x_flat = x_flat.reshape(-1, 1)
+        y_flat = y_flat.reshape(-1, 1)
 
-        u1_pred, u2_pred, _ = model(x_flat, y_flat)
-        u1_star, u2_star, _ = get_analytical_solution(x_flat, y_flat)
+        u1_pred, u2_pred, P_pred = model(x_flat, y_flat)
+        u1_star, u2_star, P_star = get_analytical_solution(x_flat, y_flat)
 
-        l2_u1 = torch.sqrt(((u1_pred-u1_star)**2).mean()).item()
-        l2_u2 = torch.sqrt(((u2_pred-u2_star)**2).mean()).item()
-
-        eps = 1e-8
+        l2_u1 = torch.sqrt(((u1_pred - u1_star)**2).mean()).item()
+        l2_u2 = torch.sqrt(((u2_pred - u2_star)**2).mean()).item()
         norm_u1 = torch.norm(u1_star).item()
         norm_u2 = torch.norm(u2_star).item()
-        rel_u1 = l2_u1 / (norm_u1 + eps) *100
-        rel_u2 = l2_u2 / (norm_u2 + eps) *100
+        eps = 1e-8
+        rel_u1 = l2_u1 / (norm_u1 + eps) * 100
+        rel_u2 = l2_u2 / (norm_u2 + eps) * 100
 
-    return l2_u1, l2_u2, rel_u1, rel_u2
+        l2_P = torch.sqrt(((P_pred - P_star)**2).mean()).item()
+        norm_P = torch.norm(P_star).item()
+        rel_P = l2_P / (norm_P + eps) * 100
 
-def visualize_results(model, loss_history=None, save_path=None, show_plot=False):
+    return l2_u1, l2_u2, rel_u1, rel_u2, l2_P, rel_P
+
+def visualize_results(model, save_path=None, show_plot=False):
     model.eval()
     with torch.no_grad():
         n_grid = 100
@@ -194,8 +210,8 @@ def visualize_results(model, loss_history=None, save_path=None, show_plot=False)
         x_flat = x_grid.reshape(-1, 1)
         y_flat = y_grid.reshape(-1, 1)
 
-        u1_pred, u2_pred, _ = model(x_flat, y_flat)
-        u1_star, u2_star, _ = get_analytical_solution(x_flat, y_flat)
+        u1_pred, u2_pred, P_pred = model(x_flat, y_flat)
+        u1_star, u2_star, P_star = get_analytical_solution(x_flat, y_flat)
 
         u1_pred_grid = u1_pred.reshape(n_grid, n_grid).cpu().numpy()
         u1_star_grid = u1_star.reshape(n_grid, n_grid).cpu().numpy()
@@ -205,27 +221,39 @@ def visualize_results(model, loss_history=None, save_path=None, show_plot=False)
         u2_star_grid = u2_star.reshape(n_grid, n_grid).cpu().numpy()
         u2_err_grid = np.abs(u2_pred_grid - u2_star_grid)
 
+        P_pred_grid = P_pred.reshape(n_grid, n_grid).cpu().numpy()
+        P_star_grid = P_star.reshape(n_grid, n_grid).cpu().numpy()
+        P_err_grid = np.abs(P_pred_grid - P_star_grid)
+
         x_plot = x_grid.cpu().numpy()
         y_plot = y_grid.cpu().numpy()
 
-        fig, axes = plt.subplots(2, 3, figsize=(16,8))
-        fig.suptitle(f'Tr-PINNs Results (Re={Re}) ', fontsize=16)
+        fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+        fig.suptitle(f'PINN Results (Re={Re})', fontsize=16)
 
-        axes[0,0].contourf(x_plot, y_plot, u1_pred_grid, cmap='viridis', levels=50)
-        axes[0,0].set_title('u₁ Prediction')
-        axes[0,1].contourf(x_plot, y_plot, u1_star_grid, cmap='viridis', levels=50)
-        axes[0,1].set_title('u₁ Analytical')
-        im3 = axes[0,2].contourf(x_plot, y_plot, u1_err_grid, cmap='viridis', levels=50)
-        axes[0,2].set_title(f'u₁ Error max={u1_err_grid.max():.4f}')
-        plt.colorbar(im3, ax=axes[0,2])
+        axes[0, 0].contourf(x_plot, y_plot, u1_pred_grid, cmap='viridis', levels=50)
+        axes[0, 0].set_title('u₁ Prediction')
+        axes[0, 1].contourf(x_plot, y_plot, u1_star_grid, cmap='viridis', levels=50)
+        axes[0, 1].set_title('u₁ Analytical')
+        im3 = axes[0, 2].contourf(x_plot, y_plot, u1_err_grid, cmap='viridis', levels=50)
+        axes[0, 2].set_title(f'u₁ Error max={u1_err_grid.max():.4f}')
+        plt.colorbar(im3, ax=axes[0, 2])
 
-        axes[1,0].contourf(x_plot, y_plot, u2_pred_grid, cmap='viridis', levels=50)
-        axes[1,0].set_title('u₂ Prediction')
-        axes[1,1].contourf(x_plot, y_plot, u2_star_grid, cmap='viridis', levels=50)
-        axes[1,1].set_title('u₂ Analytical')
-        im6 = axes[1,2].contourf(x_plot, y_plot, u2_err_grid, cmap='viridis', levels=50)
-        axes[1,2].set_title(f'u₂ Error max={u2_err_grid.max():.4f}')
-        plt.colorbar(im6, ax=axes[1,2])
+        axes[1, 0].contourf(x_plot, y_plot, u2_pred_grid, cmap='viridis', levels=50)
+        axes[1, 0].set_title('u₂ Prediction')
+        axes[1, 1].contourf(x_plot, y_plot, u2_star_grid, cmap='viridis', levels=50)
+        axes[1, 1].set_title('u₂ Analytical')
+        im6 = axes[1, 2].contourf(x_plot, y_plot, u2_err_grid, cmap='viridis', levels=50)
+        axes[1, 2].set_title(f'u₂ Error max={u2_err_grid.max():.4f}')
+        plt.colorbar(im6, ax=axes[1, 2])
+
+        axes[2, 0].contourf(x_plot, y_plot, P_pred_grid, cmap='viridis', levels=50)
+        axes[2, 0].set_title('P Prediction (zero-mean)')
+        axes[2, 1].contourf(x_plot, y_plot, P_star_grid, cmap='viridis', levels=50)
+        axes[2, 1].set_title('P Analytical (zero-mean)')
+        im9 = axes[2, 2].contourf(x_plot, y_plot, P_err_grid, cmap='viridis', levels=50)
+        axes[2, 2].set_title(f'P Error max={P_err_grid.max():.4f}')
+        plt.colorbar(im9, ax=axes[2, 2])
 
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -248,39 +276,40 @@ def train_pinn():
 
         def closure():
             optimizer.zero_grad()
-            total_loss, loss_eq, loss_bnd = compute_total_loss(model)
+            total_loss, _, _, _ = compute_total_loss(model)
             total_loss.backward()
             return total_loss
 
         optimizer.step(closure)
-        total_loss, loss_eq, loss_bnd = compute_total_loss(model)
+
+        total_loss, loss_eq, loss_bnd, loss_p_mean = compute_total_loss(model)
         scheduler.step()
 
         if iter % 1000 == 0:
             loss_history.append({"iter": iter, "total_loss": total_loss.item()})
-            l2_u1, l2_u2, rel_u1, rel_u2 = calculate_errors(model)
+            l2_u1, l2_u2, rel_u1, rel_u2, l2_P, rel_P = calculate_errors(model)
             print(f"\n==================== Iteration {iter:5d} ====================")
-            print(f"Total Loss: {total_loss.item():.6f} | Equation Residual: {loss_eq.item():.6f} | Boundary Loss: {loss_bnd.item():.6f}")
-            print(f"L2 RMSE: u1={l2_u1:.6f}, u2={l2_u2:.6f}")
-            print(f"L2 Relative Error: u1={rel_u1:.6%}, u2={rel_u2:.6%}")
+            print(f"Total Loss: {total_loss.item():.6f} | Eq: {loss_eq.item():.6f} | Bnd: {loss_bnd.item():.6f} | P_mean: {loss_p_mean.item():.6f}")
+            print(f"L2 RMSE: u1={l2_u1:.6f}, u2={l2_u2:.6f}, P={l2_P:.6f}")
+            print(f"L2 Relative Error: u1={rel_u1:.4%}, u2={rel_u2:.4%}, P={rel_P:.4%}")
             visualize_results(model, save_path=f"pinn_results/iter_H{iter}.png", show_plot=False)
 
     print("\n==================== Training Complete! Final Errors ====================")
-    l2_u1, l2_u2, rel_u1, rel_u2 = calculate_errors(model)
-    print(f"L2 RMSE: u1={l2_u1:.6f}, u2={l2_u2:.6f}")
-    print(f"L2 Relative Error: u1={rel_u1:.6%}, u2={rel_u2:.6%}")
+    l2_u1, l2_u2, rel_u1, rel_u2, l2_P, rel_P = calculate_errors(model)
+    print(f"L2 RMSE: u1={l2_u1:.6f}, u2={l2_u2:.6f}, P={l2_P:.6f}")
+    print(f"L2 Relative Error: u1={rel_u1:.4%}, u2={rel_u2:.4%}, P={rel_P:.4%}")
 
     model.eval()
     with torch.no_grad():
         n_grid = 100
         x_val = torch.linspace(x_range[0], x_range[1], n_grid, device=device)
-        y_val = torch.linspace(x_range[0], y_range[1], n_grid, device=device)
+        y_val = torch.linspace(y_range[0], y_range[1], n_grid, device=device)
         X, Y = torch.meshgrid(x_val, y_val, indexing="ij")
         x_flat = X.reshape(-1, 1)
         y_flat = Y.reshape(-1, 1)
 
-        u1_pred, u2_pred, _ = model(x_flat, y_flat)
-        u1_true, u2_true, _ = get_analytical_solution(x_flat, y_flat)
+        u1_pred, u2_pred, P_pred = model(x_flat, y_flat)
+        u1_true, u2_true, P_true = get_analytical_solution(x_flat, y_flat)
 
         x_np = x_flat.cpu().numpy().squeeze()
         y_np = y_flat.cpu().numpy().squeeze()
@@ -288,6 +317,8 @@ def train_pinn():
         u2_pred_np = u2_pred.cpu().numpy().squeeze()
         u1_true_np = u1_true.cpu().numpy().squeeze()
         u2_true_np = u2_true.cpu().numpy().squeeze()
+        P_pred_np = P_pred.cpu().numpy().squeeze()
+        P_true_np = P_true.cpu().numpy().squeeze()
 
     df = pd.DataFrame({
         "x": x_np,
@@ -296,8 +327,10 @@ def train_pinn():
         "u2_pred": u2_pred_np,
         "u1_true": u1_true_np,
         "u2_true": u2_true_np,
+        "P_pred": P_pred_np,
+        "P_true": P_true_np,
     })
-    df.to_csv("pinn_results/final_predictions.csv", index=False, encoding="utf-8-sig")
+    df.to_csv("pinn_results/final_predictionsCase1H.csv", index=False, encoding="utf-8-sig")
     print("\nAll grid point predictions saved to: pinn_results/final_predictions-H.csv")
 
     visualize_results(model, show_plot=True)
@@ -305,10 +338,10 @@ def train_pinn():
 
 if __name__ == "__main__":
     trained_model, loss_history = train_pinn()
-    plt.figure(figsize=(10,6))
+    plt.figure(figsize=(10, 6))
     plt.semilogy([h["iter"] for h in loss_history], [h["total_loss"] for h in loss_history])
     plt.xlabel("Iteration")
     plt.ylabel("Loss (Log Scale)")
-    plt.title("Training Loss | Unsupervised + Random Interior Points")
+    plt.title("Training Loss with Pressure Mean Constraint")
     plt.grid()
     plt.show()
